@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/git"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -111,6 +112,14 @@ func runProve(cmd *cobra.Command, args []string) {
 	duplicateThreshold, _ := cmd.Flags().GetFloat64("duplicate-threshold")
 	pathHints, _ := cmd.Flags().GetStringArray("path-hint")
 	titlePrefixRegex, _ := cmd.Flags().GetString("title-prefix-regex")
+	var titlePrefixRE *regexp.Regexp
+	if titlePrefixRegex != "" {
+		re, err := regexp.Compile(titlePrefixRegex)
+		if err != nil {
+			FatalError("invalid --title-prefix-regex: %v", err)
+		}
+		titlePrefixRE = re
+	}
 	ctx := rootCtx
 
 	result, err := resolveAndGetIssueWithRouting(ctx, store, issueID)
@@ -130,8 +139,14 @@ func runProve(cmd *cobra.Command, args []string) {
 	if err != nil {
 		FatalErrorRespectJSON("fetching issues: %v", err)
 	}
-	repoRoot, _ := os.Getwd()
-	packet := buildProofPacket(details, allIssues, duplicateThreshold, pathHints, titlePrefixRegex, repoRoot)
+	repoRoot := git.GetRepoRoot()
+	if repoRoot == "" {
+		repoRoot, err = os.Getwd()
+		if err != nil {
+			FatalError("resolving workspace root: %v", err)
+		}
+	}
+	packet := buildProofPacket(details, allIssues, duplicateThreshold, pathHints, titlePrefixRE, repoRoot)
 
 	if jsonOutput {
 		outputJSON(packet)
@@ -155,7 +170,7 @@ func buildIssueDetailsForProve(ctx context.Context, issueStore storage.Storage, 
 	return details
 }
 
-func buildProofPacket(details *types.IssueDetails, allIssues []*types.Issue, duplicateThreshold float64, pathHints []string, titlePrefixRegex string, repoRoot string) provePacket {
+func buildProofPacket(details *types.IssueDetails, allIssues []*types.Issue, duplicateThreshold float64, pathHints []string, titlePrefixRE *regexp.Regexp, repoRoot string) provePacket {
 	texts := []string{
 		details.Description,
 		details.AcceptanceCriteria,
@@ -165,14 +180,14 @@ func buildProofPacket(details *types.IssueDetails, allIssues []*types.Issue, dup
 		texts = append(texts, comment.Text)
 	}
 	strong, weak, testLike := scoreTextSignals(texts)
-	pathEvidence := buildPathEvidence(texts, pathHints, repoRoot)
+	pathEvidence := buildPathEvidence(texts, pathHints, repoRoot, 12)
 	existingPaths := 0
 	for _, item := range pathEvidence {
 		if item.Exists {
 			existingPaths++
 		}
 	}
-	duplicates := findDuplicateCandidates(details.Issue, allIssues, duplicateThreshold, titlePrefixRegex)
+	duplicates := findDuplicateCandidates(details.Issue, allIssues, duplicateThreshold, titlePrefixRE)
 
 	classification := "active_candidate"
 	confidence := 0.45
@@ -281,12 +296,19 @@ func scoreTextSignals(texts []string) (int, int, int) {
 	return strong, weak, testLike
 }
 
-func buildPathEvidence(texts []string, pathHints []string, repoRoot string) []provePathEvidence {
+func buildPathEvidence(texts []string, pathHints []string, repoRoot string, limit int) []provePathEvidence {
 	seen := map[string]struct{}{}
 	evidence := []provePathEvidence{}
+	absRepoRoot, err := filepath.Abs(repoRoot)
+	if err != nil {
+		return evidence
+	}
 	for _, text := range texts {
 		matches := provePathPattern.FindAllString(text, -1)
 		for _, raw := range matches {
+			if len(evidence) >= limit {
+				return evidence
+			}
 			pathText := strings.Trim(raw, ".,;:()[]{}<>\"'")
 			if pathText == "" {
 				continue
@@ -306,12 +328,15 @@ func buildPathEvidence(texts []string, pathHints []string, repoRoot string) []pr
 			if _, ok := seen[key]; ok {
 				continue
 			}
-			seen[key] = struct{}{}
-			resolved := pathText
-			if !filepath.IsAbs(pathText) {
-				resolved = filepath.Join(repoRoot, pathText)
+			if filepath.IsAbs(pathText) {
+				continue
 			}
+			resolved := filepath.Join(absRepoRoot, pathText)
 			resolved = filepath.Clean(resolved)
+			if !isWithinRoot(absRepoRoot, resolved) {
+				continue
+			}
+			seen[key] = struct{}{}
 			_, err := os.Stat(resolved)
 			evidence = append(evidence, provePathEvidence{
 				PathText:     pathText,
@@ -320,19 +345,16 @@ func buildPathEvidence(texts []string, pathHints []string, repoRoot string) []pr
 			})
 		}
 	}
-	if len(evidence) > 12 {
-		return evidence[:12]
-	}
 	return evidence
 }
 
-func findDuplicateCandidates(issue types.Issue, allIssues []*types.Issue, threshold float64, titlePrefixRegex string) []map[string]any {
+func findDuplicateCandidates(issue types.Issue, allIssues []*types.Issue, threshold float64, titlePrefixRE *regexp.Regexp) []map[string]any {
 	candidates := []map[string]any{}
 	for _, other := range allIssues {
 		if other.ID == issue.ID {
 			continue
 		}
-		score := duplicateScore(issue.Title, other.Title, titlePrefixRegex)
+		score := duplicateScore(issue.Title, other.Title, titlePrefixRE)
 		if score >= threshold {
 			candidates = append(candidates, map[string]any{
 				"id":     other.ID,
@@ -356,9 +378,9 @@ func findDuplicateCandidates(issue types.Issue, allIssues []*types.Issue, thresh
 	return candidates
 }
 
-func duplicateScore(left, right, titlePrefixRegex string) float64 {
-	leftNorm := normalizeProveTitle(left, titlePrefixRegex)
-	rightNorm := normalizeProveTitle(right, titlePrefixRegex)
+func duplicateScore(left, right string, titlePrefixRE *regexp.Regexp) float64 {
+	leftNorm := normalizeProveTitle(left, titlePrefixRE)
+	rightNorm := normalizeProveTitle(right, titlePrefixRE)
 	if leftNorm == "" || rightNorm == "" {
 		return 0
 	}
@@ -389,12 +411,10 @@ func duplicateScore(left, right, titlePrefixRegex string) float64 {
 	return jaccard
 }
 
-func normalizeProveTitle(title, prefixRegex string) string {
+func normalizeProveTitle(title string, prefixRE *regexp.Regexp) string {
 	out := strings.ToLower(strings.TrimSpace(title))
-	if prefixRegex != "" {
-		if re, err := regexp.Compile(prefixRegex); err == nil {
-			out = re.ReplaceAllString(out, "")
-		}
+	if prefixRE != nil {
+		out = prefixRE.ReplaceAllString(out, "")
 	}
 	out = regexp.MustCompile(`\bp[0-4]\b`).ReplaceAllString(out, " ")
 	out = regexp.MustCompile(`[^a-z0-9]+`).ReplaceAllString(out, " ")
@@ -516,4 +536,12 @@ func minFloat(a, b float64) float64 {
 		return a
 	}
 	return b
+}
+
+func isWithinRoot(root, candidate string) bool {
+	rel, err := filepath.Rel(root, candidate)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
 }
