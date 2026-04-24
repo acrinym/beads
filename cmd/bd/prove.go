@@ -126,7 +126,7 @@ func runProve(cmd *cobra.Command, args []string) {
 	defer result.Close()
 
 	details := buildIssueDetailsForProve(ctx, result.Store, result.Issue)
-	allIssues, err := store.SearchIssues(ctx, "", types.IssueFilter{})
+	allIssues, err := result.Store.SearchIssues(ctx, "", types.IssueFilter{})
 	if err != nil {
 		FatalError("fetching issues: %v", err)
 	}
